@@ -1,0 +1,346 @@
+---
+title: "scRNA-seq Clustering, Differential Expression, and Other Fun"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+# Description
+In this part of the workshop, we'll take the filtered/processed data from part 1 and continue with some standard downstream analyses. Beyond clustering, this part is largely just a bunch of snippets of different things you can do with the data
+
+# Load package dependencies
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(fgsea)
+library(dorothea)
+library(progeny)
+```
+
+# Load the Seurat object
+
+We previously saved the data as an RDS file in our output/ subfolder. 
+
+```{r}
+seurat <- readRDS("../output/pbmc_seurat_filtered.rds")
+```
+
+Let's remind ourselves of what the data looked like
+
+```{r}
+DimPlot(seurat)
+```
+
+# Clustering
+**Important note: tSNE and UMAP are not clustering algorithms!**
+
+The semantics are important here. While tSNE/UMAP move similar data points close together, it is not defining discrete groups. With completely different cell types, you can visually tell how cells will get segregated, but we want to use an unsupervised approach where we can.
+
+The most common clustering strategy is a **graph-based clustering** method called **Louvain clustering**. These methods require the data to be represented as a nearest-neighbor graph (ie. for every cell, find the closest *k* cells). The clustering algorithms are usually based on modularity metrics--ie. how can we group nodes of the network such that nodes within a cluster are much more highly connected that nodes between clusters.
+
+First, we construct the graph on PC space 
+
+```{r}
+seurat <- FindNeighbors(seurat, dims=1:30)
+```
+
+Now we cluster the resultant graph.
+
+**NOTE:** When clustering, there is almost always a user-defined parameter to tweak the resolution of the clustering. This relates to how many/few clusters there end up being. This will depend on the types of questions you want to ask with your data. If you're looking for subtle cell state differences within, for example NK cells, it will take a high resolution to split the single NK population into several. However, if you're just interested in getting a general idea about if a certain cell type is present in your tissue, you don't need high resolution clustering to check this. 
+For 8k cells, a resolution setting of 0.2 is usually a good starting point
+
+```{r}
+seurat <- FindClusters(seurat, resolution=0.2)
+```
+
+Now when you run DimPlot, Seurat will show you clusters by default
+```{r}
+DimPlot(seurat, label=T)
+```
+
+You can see that the populations that we broadly identified as monocytes (Clusters 0,8,9) and T cells (1,3,4,5,6) have formed multiple clusters. This likely corresponds to specialized states of these cell types. If my questions were more broad (eg. "How many T cells are in the blood following infection?"), I may be interested in reducing the resolution to an appropriate level.
+
+Fow now, let's proceed with it as it is, but please explore how this changes the resulting clusters.
+
+## Optional: Relative frequency of each cluster
+This isn't necessarily part of the analysis pipeline, but you may be interested in the relative frequency of each cell type. This could be informative when comparing samples from different patients/animals, or disease vs. control.
+
+This code uses a very common data wrangling package called "dplyr"--learning this is a very good skill to have. A PDF cheatsheet of dplyr functions can be found (here)[https://rstudio.com/wp-content/uploads/2015/02/data-wrangling-cheatsheet.pdf]
+
+```{r}
+cluster_frq <- seurat@meta.data %>%
+  group_by(seurat_clusters) %>%
+  summarise(count=n()) %>%
+  mutate(relative_freq = count/sum(count)) %>%
+  mutate(data_set = "PBMC")
+```
+
+And here are the number of cells per cluster and the relative frequency
+```{r}
+cluster_frq
+```
+
+We'll plot a simple stacked bar chart of this using the popular plotting package "ggplot2". It is incredibly flexible and for the most part, you can make plots look like whatever you want with it. This is the plotting package Seurat actually uses under the hood for its plotting functions. It would be *very* good to learn.
+
+The plotting scripts are very modular. It can be simple, essentially just providing the data and telling it what type of plot you want -- geom_col() for a barchart here
+
+```{r}
+freq_plot <- ggplot(cluster_frq, aes(x = data_set, y = relative_freq, fill=seurat_clusters)) +
+  geom_col()
+
+freq_plot
+```
+
+But then we can modify lots of different components of the plot by adding extra options to the plotting script
+
+```{r}
+freq_plot <- ggplot(cluster_frq, aes(x = data_set, y = relative_freq)) +
+  geom_col(color="black", aes(fill=seurat_clusters), position = position_stack(reverse = TRUE)) +
+  ylab("Relative Frequency") +
+  scale_y_continuous(expand=c(0,0)) +
+  theme_classic() +
+  coord_flip() +
+  theme(legend.title = element_blank(),
+        axis.text.y=element_text(size=10, color='black'),
+        axis.text.x=element_blank(),
+        axis.title=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.line = element_blank())
+
+freq_plot
+```
+
+# Finding markers of each cluster
+Now that we've clustered the data, the next question is usually "well, which cluster is which cell type?". In some cases, like with PBMCs, we know a lot about specific genes expressed in different cell types. In these cases, you could just annotate it based on the expression of known markers. Instead, we'll use differential expression as a tool to identify genes that mark each cluster.
+
+The idea here is that we'll iterate through each cluster, running differential expression between the cells of that cluster and the **aggregate of all other cells**. While this may seem weird, the idea of this is to identiy genes that are uniquely expressed in a given cluster, so the ideal gene would be lowly-to-not expressed across the aggregate.
+
+**I'll discuss a more focused differential expression down below**
+
+Depending on the options you set for this function, it can be the part of the script that takes the longest. I'll set two options here that speed it up a bit. These settings are usually pretty good for identifying marking
+
+```{r}
+cluster_markers <- FindAllMarkers(seurat,
+                                  logfc.threshold = 0.5, #To test all possible genes (very slow), set this to 0
+                                  only.pos = T) #and set this to F
+```
+
+And lets look at the top markers (by logFC) for each cluster. You could click the "cluster_markers" variable in your Environment window to open up the entire table, but there may be too many to scroll through. Again, here's a bit of *dplyr* code to wrangle that table and show us the top 10 genes for each.
+
+```{r}
+cluster_markers %>%
+  group_by(cluster) %>%
+  top_n(10, avg_logFC)
+```
+
+-**p_val** is the p-value from the Wilcoxon rank sum test
+-**avg_logFC** is the log fold change between the cluster (see *cluster* column) and the aggregate of others
+-**pct.1** is the percentage of cells in the *cluster* with detectable expression of the gene
+-**pct.2** is the percentage of cells in the aggregate of other clusters that express it
+-**p_val_adj** is the Benjamini-Hochberg-adjusted p-value
+-**cluster** is the cluster being tested
+-**gene** is the gene
+
+Let's plot the top gene for every cluster
+```{r}
+top_genes <- cluster_markers %>% 
+  group_by(cluster) %>% 
+  top_n(1, avg_logFC) %>% 
+  pull(gene)
+```
+
+```{r}
+FeaturePlot(seurat, features=top_genes, cols = c("lightgrey", "red"), pt.size=0.25, 
+            combine = T)
+```
+
+By going through these markers and their expression patter, it's usually fairly straight forward to annotate each cluster. I'm not an immunologist, so I won't get into talking this too much.
+
+# Other quick visualizations
+Seurat has a few other easy tools for visualization, I'll some some here.
+
+## Violin plots
+Violin plots show the distribution of expression values for a gene across each cluster
+
+```{r}
+VlnPlot(seurat, features="CCL5", pt.size=0.25)
+```
+
+## Ridge plots
+Shows the distribution along the x-axis
+
+```{r}
+RidgePlot(seurat, features="CCL5")
+```
+
+## Heatmap
+Seurat has an option to make a heatmap of expression values, organized by cluster. Honestly, I'm not a huge fan of it, but I'll show it anyway. You can find an alternative heatmap function in Part 1.
+
+Usually for heatmaps of expression data, you will Z-score the expression values so that mean expression of every gene is 0. Otherwise, the only patterns you'll really see are which genes are expressed highly.
+
+Let's pick some genes to plot. We'll do the top 5 marker genes per cluster. 
+
+```{r}
+top_genes <- cluster_markers %>% 
+  group_by(cluster) %>% 
+  top_n(5, avg_logFC) %>% 
+  pull(gene) %>%
+  unique() #in case any markers are duplicated
+```
+
+
+```{r}
+DoHeatmap(seurat, features=top_genes)
+```
+
+## Dot Plot
+Similar to a heatmap, but it encodes two features per gene: The scaled expression and the percentage of cells in the cluster expressing the gene. By default, the gene names will be along the x-axis, written horizontally. They will all overlap eachother and it will look terribly. Like I mentioned above, plotting in Seurat is done with ggplot2. I'll cheat a little and inject some ggplot2 code on top of the Seurat script
+
+```{r}
+DotPlot(seurat, features=top_genes, cols=c('lightgrey', 'red')) + 
+  theme(axis.text = element_text(angle=45, hjust=1))
+```
+
+# Vignette: Differential expression between two defined groups
+We had only really done differential expression to find markers of clusters using the FindAllMarkers() function. Seurat also has a FindMarkers() that is specifically for comparing two groups. Although it's called Find**Markers** it can be used as a general differential expression tool for a pairwise comparison. It uses the Wilcoxon rank sum test, which was one of the best tests in a recent benchmark paper. 
+
+If you are dealing with a dataset containing two groups, you can use this as a convenient differential expression function.
+
+Its basic usage is to just compare two clusters in a seurat object. Let's compare Memory T cells (Cluster 1) with Naive T cells (Cluster 3)
+
+```{r}
+dge_tcells <- FindMarkers(seurat, ident.1 = 1, ident.2 = 3,
+                          only.pos=F,
+                          logfc.threshold = 0) # we'll test all genes
+```
+
+**NOTE:** There are other options you can set. For example, if you have an experiment with multiple datasets and you want to compare *between* conditions, but *within* a cluster (let's say arbitrarily cluster 1), you can run something like:
+FindMarkers(seurat, ident.1="Disease", ident.2="Control", group.by="Sample", subset.ident=1)
+
+**NOTE 2:** If you are dealing with data that has multiple samples and >1 condition, this approach kind of falls apart as it's a little naive and doesn't use replicate info. Check out a package like *muscat* for this.
+
+Okay, our test finished running. If you click the dge_tcells variable in your Environment window, it will pop up and you can explore it a bit.
+
+## Gene Set Enrichment Analysis (GSEA)
+GSEA is a convenient tool for looking at gene sets that are enriched at either extreme of a ranked list of genes. 
+
+Typical GO Term enrichment will just take a list of genes and use a statistical test to see if it is enriched with GO terms. This is fine and dandy, but it gets a little awkward when you have both up- and down-regulated genes. What if a GO term shows up in both? Omit it? But what if it's more enriched in one than the other?
+
+GSEA kind of gets around this issue because you can rank your results by fold change and the test will assess if gene sets (including GO terms) are statistically enriched in up or downregulated genes in one test.
+
+Before we try out GSEA, we need to import the gene sets. A variety can be found at the Broad Institute's Molecular Signatures Database (MSigDB)[https://www.gsea-msigdb.org/gsea/msigdb/index.jsp]. I've included a few key collections in this github repo that we'll load in. We'll work with all GO terms, KEGG pathways, Reactome pathways, and MSigDB Hallmark gene sets.
+
+```{r}
+hallmarks <- fgsea::gmtPathways("../data/hallmark.genesets.v6.1.symbols.gmt") #50 gene sets
+kegg <- fgsea::gmtPathways("../data/kegg.genesets.v6.1.symbols.gmt") #186
+go <- fgsea::gmtPathways("../data/GOTerms.BP.v6.1.symbols.gmt") #4436
+reactome <- fgsea::gmtPathways("../data/reactome.genesets.v6.1.symbols.gmt") #674
+
+gene_sets <- c(hallmarks, kegg, go, reactome)
+```
+
+Here's an example of one
+```{r}
+gene_sets[1]
+```
+
+We will need to organize our genes and rank them by logFC. Here's just a little wrangling
+```{r}
+dge_tcells$gene <- rownames(dge_tcells)
+dge_tcells <- dge_tcells %>% arrange(desc(avg_logFC))
+fold_changes <- dge_tcells$avg_logFC
+names(fold_changes) <- dge_tcells$gene
+```
+
+```{r}
+head(fold_changes)
+```
+
+
+Now, let's run GSEA, looking for genesets that are upregulated or downregualted comparing memory vs. naive T cells
+
+```{r}
+gsea_tcell <- fgsea(pathways = gene_sets,
+                    stats = fold_changes,
+                    minSize=5,
+                    maxSize=5000,
+                    nproc = 2)
+```
+
+```{r}
+gsea_sig <- filter(gsea_tcell, padj <= 0.05) %>%
+  arrange(NES)
+```
+
+```{r}
+head(gsea_sig)
+```
+
+Feel free to open the table and explore it a bit more.
+
+## Gene Set Scoring
+Seurat has a convenient function for scoring each cell for a reference geneset, which may allow us to get a general idea of gene set activity across a population of cells. The score corresponds to the "average expression level of each program, subtracted by the aggregated expression of a control feature set (see ?AddModuleScore). In practice, I wouldn't read too much into the specific values, but would focus on the relative changes between cells
+
+Here's an example using an interferon gamma response gene set, which is apparently down in our memory T cells (Cluster 1) relative to naive T cells (Cluster 3)
+```{r}
+seurat <- AddModuleScore(seurat, features=gene_sets["GO_CELLULAR_RESPONSE_TO_INTERFERON_GAMMA"],
+                         name="IFNG_Response")
+```
+
+Now, this module score is actually stored in our metadata table
+
+```{r}
+hist(seurat$IFNG_Response1, breaks=50)
+```
+
+And we can use standard visualization tools to look at the score in our data
+```{r}
+FeaturePlot(seurat, features="IFNG_Response1", cols=c('lightgrey', 'red'), order=T)
+```
+
+```{r}
+VlnPlot(seurat, features="IFNG_Response1", pt.size=0.1)
+```
+
+While there is a lot of variability between other clusters, we see that the score is at least modestly higher in cluster 3 than in cluster 1. We can see it a bit better if we look at just those clusters:
+
+```{r}
+VlnPlot(seurat, features="IFNG_Response1", idents=c(1,3))
+```
+
+
+# Vignette: Generic pathway activity
+This is a tool I recently started playing with that I love. Many people are interested in which signalling pathways may be affected in their data and end up resorting to GO term or KEGG pathway enrichment. While this is okay, one problem is that most of the genesets associated with signalling pathways refer to the signalling proteins themselves (the kinases) rather than the downstream targets of the pathway.
+
+PROGENy is a tool that developed a database of consensus target genes of 14 signalling pathways. It takes an expression matrix and scores each sample an an activity level for each pathway.
+
+```{r}
+exp_mat <- as.matrix(seurat[["RNA"]]@data)
+pathways <- progeny(exp_mat, 
+                    scale=T,
+                    organism="Human")
+head(pathways)
+```
+
+We can add all of this data into our metadata
+```{r}
+seurat@meta.data <- cbind(seurat@meta.data, pathways)
+```
+
+And visualize activities. I'll just get a list of the different pathways from the column names of that "pathways" variable
+
+```{r}
+RidgePlot(seurat, features = colnames(pathways), ncol = 4)
+```
+
+Hard to see unless you stretch the image out.
+
+```{r}
+FeaturePlot(seurat, features="TNFa", cols=c('lightgrey', 'red'), order=T)
+```
+
+Perhaps expected that monocytes have the higehst TNF activity
+

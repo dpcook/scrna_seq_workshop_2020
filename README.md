@@ -9,4 +9,6 @@ The notebooks/ subfolder contains the R scripts themselves. Begin with the packa
 
 The data/ subfolder contains the CellRanger output provided by 10x Genonmics, along with some MSigDB gene set lists.
 
+**I could not fit the matrix.mtx file from CellRanger into this repo. Please download the file from https://drive.google.com/drive/folders/1szqYwvJvp8gV0SOv_VQJNDAh4wQyhlMk?usp=sharing and place it in data/filtered_gene_bc_matrices_8kpbmc/GRCh38/**
+
 

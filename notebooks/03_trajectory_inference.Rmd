@@ -1,0 +1,161 @@
+---
+title: "Trajectory analysis"
+output: html_notebook
+---
+
+# Install some new packages
+```{r}
+devtools::install_github('satijalab/seurat-data')
+devtools::install_github('satijalab/seurat-wrappers')
+```
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(tidyverse)
+library(monocle3)
+```
+
+```{r}
+InstallData("hcabm40k")
+data("hcabm40k")
+```
+
+```{r}
+hcabm40k <- SplitObject(hcabm40k, split.by = "orig.ident")
+for (i in seq_along(hcabm40k)) {
+    hcabm40k[[i]] <- NormalizeData(hcabm40k[[i]]) %>% FindVariableFeatures()
+}
+features <- SelectIntegrationFeatures(hcabm40k)
+for (i in seq_along(along.with = hcabm40k)) {
+    hcabm40k[[i]] <- ScaleData(hcabm40k[[i]], features = features) %>% RunPCA(features = features)
+}
+
+anchors <- FindIntegrationAnchors(hcabm40k, reference = c(1, 2), reduction = "rpca", dims = 1:30)
+integrated <- IntegrateData(anchors, dims = 1:30)
+```
+
+```{r}
+integrated <- ScaleData(integrated)
+integrated <- RunPCA(integrated)
+integrated <- RunUMAP(integrated, dims = 1:30, reduction.name = "UMAP")
+integrated <- FindNeighbors(integrated, dims = 1:30)
+integrated <- FindClusters(integrated)
+DimPlot(integrated, group.by = c("orig.ident", "ident"))
+```
+
+```{r}
+cds <- as.cell_data_set(integrated, assay = "RNA") #CRITICAL: SET ASSAY TO RNA!!! DEFAULT IS INTEGRATED!
+cds <- cluster_cells(cds)
+```
+
+```{r}
+plot_cells(cds, show_trajectory_graph = FALSE)
+plot_cells(cds, group_cells_by = "partition", color_cells_by = "partition",
+           show_trajectory_graph = FALSE)
+```
+
+Partition 2 represents HSC differentiation.
+
+Let's subset partition 2, re-interated and embed w/ UMAP, and switch back to the RNA assay for gene quantifications
+
+```{r}
+#Subset seurat object
+integrated.sub <- subset(as.Seurat(cds), monocle3_partitions == 2)
+
+#Re-integrated. Will be different because integration features will be different for this specific subset of cells
+integrated.sub <- SplitObject(integrated.sub, split.by = "orig.ident")
+for (i in seq_along(integrated.sub)) {
+    integrated.sub[[i]] <- NormalizeData(integrated.sub[[i]]) %>% FindVariableFeatures()
+}
+features <- SelectIntegrationFeatures(integrated.sub)
+for (i in seq_along(along.with = integrated.sub)) {
+    integrated.sub[[i]] <- ScaleData(integrated.sub[[i]], features = features) %>% RunPCA(features = features, verbose=F)
+}
+
+anchors <- FindIntegrationAnchors(integrated.sub, reference = c(1, 2), reduction = "rpca", dims = 1:30)
+integrated.sub <- IntegrateData(anchors, dims = 1:30)
+
+#Finish processing
+integrated.sub <- ScaleData(integrated.sub)
+integrated.sub <- RunPCA(integrated.sub)
+integrated.sub <- RunUMAP(integrated.sub, dims = 1:30, reduction.name = "UMAP")
+integrated.sub <- FindNeighbors(integrated.sub, dims = 1:30)
+integrated.sub <- FindClusters(integrated.sub)
+
+DimPlot(integrated.sub, group.by = c("orig.ident", "ident"))
+```
+
+```{r}
+cds <- as.cell_data_set(integrated.sub, assay="RNA")
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+```
+
+```{r}
+plot_cells(cds, label_groups_by_cluster = FALSE, label_leaves = FALSE, label_branch_points = FALSE)
+```
+
+```{r}
+DefaultAssay(integrated.sub) <- "RNA"
+max.avp <- which.max(unlist(FetchData(integrated.sub, "AVP"))) #Find the cell which has the highest AVP (HSC marker) expression
+max.avp <- colnames(integrated.sub)[max.avp]
+cds <- order_cells(cds, root_cells = max.avp)
+```
+
+```{r}
+plot_cells(cds, color_cells_by = "pseudotime", label_cell_groups = F, label_leaves = F, 
+    label_branch_points = F)
+plot_cells(cds, label_cell_groups = T, label_leaves = T, 
+    label_branch_points = T)
+```
+
+# Differential expression
+```{r}
+#Weird requirement for monocle to run the following differential expression
+## Calculate size factors using built-in function in monocle3
+cds <- estimate_size_factors(cds)
+cds@rowRanges@elementMetadata@listData[["gene_short_name"]] <- rownames(integrated.sub[["RNA"]])
+```
+
+```{r}
+#Whole dataset, just run this--takes ~35 mins
+de_results <- graph_test(cds, neighbor_graph="principal_graph")
+sig_genes <- row.names(subset(de_results, q_value < 0.05))
+```
+
+```{r}
+head(de_results %>% arrange(q_value))
+```
+
+```{r}
+plot_cells(cds, genes=c("NOC2L", "HES4", "ATAD3B", "DFFA"),
+           label_leaves=FALSE, label_branch_points = FALSE)
+```
+
+
+Let's manually choose some cells to assess
+```{r}
+cds_subset <- choose_cells(cds)
+```
+
+```{r}
+subset_de_results <- graph_test(cds_subset, neighbor_graph="principal_graph",
+                                cores=2)
+sig_genes_subset <- row.names(subset(subset_de_results, q_value < 0.05))
+#Need to run preprocess first apparently
+#Can define modules, though haven't worked too much with this
+cds_subset <- preprocess_cds(cds_subset)
+gene_module_df <- find_gene_modules(cds_subset[sig_genes_subset,], resolution=c(10^seq(-6,-1)))
+```
+
+```{r}
+head(subset_de_results %>% arrange(q_value), n=20)
+```
+
+```{r}
+plot_cells(cds_subset, genes=c("HES4", "C1QA", "S100A9", "CD1C"),
+           label_leaves=FALSE, label_branch_points = FALSE)
+```
+
